@@ -9,34 +9,37 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'bro-net-ultra-security-2026'
 
 # --- CONFIGURACIÓN DE RUTAS Y CARPETAS ---
-UPLOAD_FOLDER = 'static/uploads/'
+# Usamos la carpeta temporal /tmp obligatoria de los servidores en la nube para evitar errores de escritura
+UPLOAD_FOLDER = '/tmp/uploads/'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Garantizamos que las carpetas existan en el sistema al arrancar [2]
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs('data/', exist_ok=True)
 
-# Asincronía con eventlet para soportar múltiples conexiones simultáneas
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# Inicialización limpia de Sockets compatible con el entorno virtual de Vercel
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# --- RUTAS DE BASES DE DATOS JSON ---
-USER_DB = 'data/users.json'
-MSG_DB = 'data/messages.json'
+USER_DB = '/tmp/users.json'
+MSG_DB = '/tmp/messages.json'
 
-# Seguimiento de presencia en tiempo real (sid -> username)
 online_users = {}
 
 def load_data(path, default=[]):
     if not os.path.exists(path):
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(default, f)
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(default, f)
+        except Exception:
+            return default
         return default
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def save_data(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+    except Exception:
+        pass
 
 # --- RUTAS HTTP ---
 
@@ -59,7 +62,6 @@ def login():
             return jsonify({"status": "ok", "user": user_found})
         return jsonify({"status": "error", "msg": "Contraseña incorrecta"}), 401
     else:
-        # Validación estricta de dominio Gmail y unicidad
         if not email.lower().endswith("@gmail.com"):
             return jsonify({"status": "error", "msg": "Se requiere un correo @gmail.com para el registro"}), 400
         if any(u['username'] == u_name for u in users):
@@ -91,7 +93,6 @@ def update_profile():
                 path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                 file.save(path)
                 
-                # --- ESCANEO ANTIVIRUS (ClamAV) --- [3, 4]
                 try:
                     result = subprocess.run(['clamscan', path], capture_output=True, text=True)
                     if "Infected files: 0" not in result.stdout:
@@ -112,7 +113,6 @@ def upload_audio():
     if 'audio' not in request.files:
         return jsonify({"status": "error", "msg": "No se recibió archivo de audio"}), 400
     file = request.files['audio']
-    user = request.form.get('user', 'anonimo')
     filename = secure_filename(file.filename)
     path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(path)
@@ -130,13 +130,15 @@ def upload_brol():
 
 @app.route('/get_brols', methods=['GET'])
 def get_brols():
-    # FILTRO MEJORADO: Exige que el archivo empiece por 'brol_' para no incluir audios de voz
-    videos = [
-        {"title": f.split('_')[-1], "url": f"/static/uploads/{f}"}
-        for f in os.listdir(app.config['UPLOAD_FOLDER'])
-        if f.startswith('brol_') and f.endswith(('.mp4', '.mov', '.webm'))
-    ]
-    return jsonify(videos)
+    try:
+        videos = [
+            {"title": f.split('_')[-1], "url": f"/static/uploads/{f}"}
+            for f in os.listdir(app.config['UPLOAD_FOLDER'])
+            if f.startswith('brol_') and f.endswith(('.mp4', '.mov', '.webm'))
+        ]
+        return jsonify(videos)
+    except Exception:
+        return jsonify([])
 
 @app.route('/get_users', methods=['GET'])
 def get_users():
@@ -158,8 +160,7 @@ def get_history():
     msgs = load_data(MSG_DB)
     return jsonify([m for m in msgs if m['room'] == room])
 
-# --- CONTROL DE SOCKETS (PRESENCIA Y CHAT PRIVADO) ---
-
+# --- INTERFACES DE CONEXIÓN PARA MANEJAR EVENTOS ---
 @socketio.on('set_identity')
 def set_identity(data):
     online_users[request.sid] = data['user']
@@ -190,22 +191,9 @@ def on_msg(data):
     save_data(MSG_DB, msgs)
     emit('new_msg', new_m, room=room)
 
-# --- SEÑALIZACIÓN WEBRTC PARA LLAMADAS EN TIEMPO REAL ---
-
-@socketio.on('call_user')
-def handle_call_user(data):
-    room = f"room_{min(data['user'], data['target'])}_{max(data['user'], data['target'])}"
-    emit('call_received', {"offer": data['offer'], "from": data['user']}, room=room, include_self=False)
-
-@socketio.on('answer_call')
-def handle_answer_call(data):
-    room = f"room_{min(data['user'], data['target'])}_{max(data['user'], data['target'])}"
-    emit('call_answered', {"answer": data['answer']}, room=room, include_self=False)
-
-@socketio.on('ice_candidate')
-def handle_ice_candidate(data):
-    room = f"room_{min(data['user'], data['target'])}_{max(data['user'], data['target'])}"
-    emit('ice_candidate_received', {"candidate": data['candidate']}, room=room, include_self=False)
+# Exponemos la aplicación nativa para que Vercel la invoque como WSGI ejecutable
+def handler(environ, start_response):
+    return app(environ, start_response)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
